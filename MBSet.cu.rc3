@@ -1,0 +1,383 @@
+// Calculate and display the Mandelbrot set
+// ECE4893/8893 final project, Fall 2011
+
+#include <iostream>
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include <stdlib.h>
+#include <time.h>
+#include <pthread.h>
+#include <cuda_runtime_api.h>
+#include <GL/glut.h>
+#include <GL/glext.h>
+#include <GL/gl.h>
+#include <GL/glu.h>
+#include <GL/freeglut.h>
+#include <stack>
+#include "Complex.cu"
+
+using namespace std;
+
+#define WINDOW_DIM 512
+#define threadsPerBlock 16 
+#define numBLOCKS (WINDOW_DIM*WINDOW_DIM/threadsPerBlock)
+
+// Min and max complex plane values
+Complex  minC(-2.0, -1.2);
+Complex  maxC( 1.0, 1.8);
+int      maxIt = 2000;     // Max iterations for the set computations
+int size = sizeof(int)*WINDOW_DIM*WINDOW_DIM;
+int *result = (int*) malloc(size);      // stores computed result of MBSet data
+// stores new range of c
+Complex new_minC(0.0, 0.0);
+Complex new_maxC(0.0, 0.0);
+Complex temp_minC(0.0, 0.0);
+int valid=0,zoom_flag=0,mouse_flag=0;   
+stack<float> arrayCR, arrayCI;          // stores history of range of C
+
+int *dev_res;		// device copy
+
+// Define the RGB Class for coloring MBSet
+class RGB
+{
+  public:
+    RGB()
+      : r(0), g(0), b(0) {} //black
+    RGB(double r0, double g0, double b0)
+      : r(r0), g(g0), b(b0) {}
+  public:
+    double r;
+    double g;
+    double b;
+};
+
+RGB* colors = 0; // Array of color values
+
+void initColors()
+{
+  srand48(time(NULL)); //seed for different colors everytime
+  colors = new RGB[maxIt + 1];
+  for (int i = 0; i < maxIt; i++)
+  {
+    if (i < 7)
+    { // white for small iterations
+      colors[i] = RGB(1, 1, 1);
+    }
+    else
+    {
+      colors[i] = RGB(drand48(), drand48(), drand48());
+    }
+  }
+  colors[maxIt] = RGB(); // black
+}
+
+__global__ void calcMBdata(Complex  minC, Complex maxC, int* dev_res, int maxIt)
+{	
+	int index=threadIdx.x + blockIdx.x * blockDim.x;
+	int indxR=index/WINDOW_DIM;
+	int indxI=index%WINDOW_DIM;
+	
+	float creal=minC.r + indxR*(maxC.r - minC.r)/(WINDOW_DIM);
+	float cimag=minC.i + indxI*(maxC.i - minC.i)/(WINDOW_DIM);
+	Complex c(creal,cimag);
+	Complex Z(creal,cimag);
+	
+	int k=0;
+	while(k<maxIt && Z.magnitude2()<4.0f)
+	{
+		Z=Z*Z+c;
+		k++;
+	}
+	dev_res[indxR+indxI*WINDOW_DIM]=k;
+}
+
+void createCudaThreads()
+{
+  cudaMalloc( (void**)&dev_res, size );
+  
+  calcMBdata<<< numBLOCKS, threadsPerBlock >>>(minC,maxC,dev_res,maxIt);
+  cudaMemcpy( result, dev_res, size, cudaMemcpyDeviceToHost );
+}
+
+//draw the MBSet based on the iterations calculated by calcMBdata
+void drawMBSet(void)
+{
+  int count;
+  glBegin(GL_POINTS);
+  for (int i = 0; i < WINDOW_DIM; i++)
+  {
+    for (int j = 0; j < WINDOW_DIM; j++)
+    {
+    	count = i+j*WINDOW_DIM;
+	    glColor3f(colors[result[count]].r,colors[result[count]].g,colors[result[count]].b);
+	    glVertex2f(i,j);      
+    }     
+  }
+  glEnd();
+}
+
+//draw the zoom box square
+void selectionBox(void)
+{
+  mouse_flag=0;
+  glLoadIdentity();
+  gluOrtho2D(0, WINDOW_DIM, WINDOW_DIM, 0); 
+  glColor3f(1.0, 0.0, 0.0);
+  glLineWidth(3.0);
+  glBegin(GL_LINE_LOOP);
+  glVertex2f(new_minC.r, new_minC.i);
+  glVertex2f(new_maxC.r, new_minC.i);
+  glVertex2f(new_maxC.r, new_maxC.i);
+  glVertex2f(new_minC.r, new_maxC.i);
+  glEnd();
+}
+
+void display(void)
+{
+  glClear(GL_COLOR_BUFFER_BIT);
+  glLoadIdentity();
+  gluOrtho2D(0, WINDOW_DIM, WINDOW_DIM, 0);
+  drawMBSet();
+  if(mouse_flag==1)
+    selectionBox();
+  glutSwapBuffers();
+}
+
+void init(void)
+{
+  glShadeModel(GL_SMOOTH);
+}
+
+void timer(int)
+{
+  glutPostRedisplay();
+  glutTimerFunc(1, timer, 0);
+}
+
+void reshape(int w, int h)
+{ // Your OpenGL window reshape code here
+  GLfloat aspect = (GLfloat) w / (GLfloat) h;
+  glViewport(0, 0, w, h);
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  if (w <= h)
+    glOrtho(-1.25, 1.25, -1.25 * aspect, 1.25 * aspect, -2.0, 2.0);
+  else
+    glOrtho(-1.25 * aspect, 1.25 * aspect, -1.25, 1.25, -2.0, 2.0);
+  glMatrixMode(GL_MODELVIEW);
+  glutPostRedisplay();
+}
+
+void mouse(int button, int state, int x, int y)
+{ // Your mouse click processing here
+  // state == 0 means pressed, state != 0 means released
+  // Note that the x and y coordinates passed in are in
+  // PIXELS, with y = 0 at the top.
+  zoom_flag=1;
+  if(button == GLUT_LEFT_BUTTON && state == GLUT_DOWN)
+  {
+    new_minC.r = x;
+    new_minC.i = y;    
+    temp_minC.i=new_minC.i;
+    temp_minC.r=new_minC.r;
+    arrayCR.push(minC.r);
+    arrayCI.push(minC.i);
+    arrayCR.push(maxC.r); 
+    arrayCI.push(maxC.i);
+  }
+  if(button == GLUT_LEFT_BUTTON && state == GLUT_UP)
+  {
+    new_maxC.r = x;
+    new_maxC.i = y;
+    valid = 1;
+  }
+  if(valid==1)
+  {
+    new_minC.r=temp_minC.r;
+    new_minC.i=temp_minC.i;
+    int xdel,ydel;
+    xdel=new_maxC.r-new_minC.r;
+    ydel=new_maxC.i-new_minC.i;
+
+    if((new_minC.r<new_maxC.r)&&(new_minC.i<new_maxC.i))
+    {   
+      if(xdel<0)
+        xdel=-xdel;
+      if(ydel<0)
+        ydel=-ydel;
+      if(xdel>ydel)
+        new_maxC.r=new_minC.r+(new_maxC.i-new_minC.i);
+      if(xdel<ydel)
+        new_maxC.i=new_minC.i+(new_maxC.r-new_minC.r);    
+    }
+    //up left
+    else if((new_minC.r>new_maxC.r)&&(new_minC.i>new_maxC.i))
+    { 
+      if(xdel<0)
+        xdel=-xdel;
+      if(ydel<0)
+        ydel=-ydel;
+      if(xdel>ydel)
+        new_maxC.r=new_minC.r+(new_maxC.i-new_minC.i);
+      if(xdel<ydel)
+        new_maxC.i=new_minC.i+(new_maxC.r-new_minC.r);
+    } 
+    //up right 
+    else if((new_minC.r<new_maxC.r)&&(new_minC.i>new_maxC.i)) 
+    { 
+      if(xdel<0)
+        xdel=-xdel;
+      if(ydel<0)
+        ydel=-ydel;
+      if(xdel>ydel)
+        new_maxC.r=new_minC.r-(new_maxC.i-new_minC.i);
+      if(xdel<ydel)
+        new_maxC.i=new_minC.i-(new_maxC.r-new_minC.r);       
+    } 
+    //down left 
+    else if((new_minC.r>new_maxC.r)&&(new_minC.i<new_maxC.i)) 
+    {        
+      if(xdel<0)
+        xdel=-xdel;
+      if(ydel<0)
+        ydel=-ydel;
+      if(xdel>ydel)
+        new_maxC.r=new_minC.r-(new_maxC.i-new_minC.i);
+      if(xdel<ydel)
+        new_maxC.i=new_minC.i-(new_maxC.r-new_minC.r);    
+    }
+    
+    double x_delta=((maxC.r-minC.r)/WINDOW_DIM);
+    double y_delta=((maxC.i-minC.i)/WINDOW_DIM);   
+    double new_minCRe=minC.r +(new_minC.r*x_delta);
+    double new_minCIm=minC.i +(new_maxC.i*y_delta);
+    double new_maxCRe=minC.r +(new_maxC.r*x_delta);
+    double new_maxCIm=minC.i +(new_minC.i*y_delta);
+    minC.r = new_minCRe;
+    minC.i = new_minCIm;
+    maxC.r = new_maxCRe;
+    maxC.i = new_maxCIm;
+
+    // avoids inversion of range of C
+    if(maxC.r < minC.r)
+    {
+      swap(maxC.r,minC.r);
+    }   
+    if(maxC.i < minC.i)
+    {
+      swap(maxC.i,minC.i);
+    }      
+    valid=0;
+    selectionBox();
+    glutSwapBuffers();
+    createCudaThreads();
+    display();
+  }  
+}
+
+void motion(int x , int y)
+{ // Your mouse motion here, x and y coordinates are as above
+  new_maxC.r = x;
+  new_maxC.i = y;
+  int xdel,ydel;
+  new_minC.r=temp_minC.r;
+  new_minC.i=temp_minC.i;
+  //bottom right
+  xdel=new_maxC.r-new_minC.r;
+  ydel=new_maxC.i-new_minC.i;
+  if((new_minC.r<new_maxC.r)&&(new_minC.i<new_maxC.i))
+  {   
+    if(xdel<0)
+      xdel=-xdel;
+    if(ydel<0)
+      ydel=-ydel;
+    if(xdel>ydel)
+      new_maxC.r=new_minC.r+(new_maxC.i-new_minC.i);
+    if(xdel<ydel)
+      new_maxC.i=new_minC.i+(new_maxC.r-new_minC.r);    
+  }
+  //top left
+  else if((new_minC.r>new_maxC.r)&&(new_minC.i>new_maxC.i))
+  { 
+    if(xdel<0)
+      xdel=-xdel;
+    if(ydel<0)
+      ydel=-ydel;
+    if(xdel>ydel)
+      new_maxC.r=new_minC.r+(new_maxC.i-new_minC.i);
+    if(xdel<ydel)
+      new_maxC.i=new_minC.i+(new_maxC.r-new_minC.r);
+  } 
+  //top right 
+  else if((new_minC.r<new_maxC.r)&&(new_minC.i>new_maxC.i)) 
+  { 
+    if(xdel<0)
+      xdel=-xdel;
+    if(ydel<0)
+      ydel=-ydel;
+    if(xdel>ydel)
+      new_maxC.r=new_minC.r-(new_maxC.i-new_minC.i);
+    if(xdel<ydel)
+      new_maxC.i=new_minC.i-(new_maxC.r-new_minC.r);       
+  } 
+  //bottom left 
+  else if((new_minC.r>new_maxC.r)&&(new_minC.i<new_maxC.i)) 
+  {        
+    if(xdel<0)
+      xdel=-xdel;
+    if(ydel<0)
+      ydel=-ydel;
+    if(xdel>ydel)
+      new_maxC.r=new_minC.r-(new_maxC.i-new_minC.i);
+    if(xdel<ydel)
+      new_maxC.i=new_minC.i-(new_maxC.r-new_minC.r);    
+  }
+  mouse_flag=1;
+  glutPostRedisplay();
+}
+
+void keyboard(unsigned char key, int x, int y)
+{ // Your keyboard processing here
+  if(key == 'b')
+  {
+    if( (!arrayCI.empty()) && (!arrayCR.empty()) )
+    {
+      maxC.i = arrayCI.top();
+      arrayCI.pop();
+      maxC.r = arrayCR.top();
+      arrayCR.pop();
+      minC.i = arrayCI.top();
+      arrayCI.pop();
+      minC.r = arrayCR.top();
+      arrayCR.pop();
+    }
+    createCudaThreads();
+    display();
+  }
+}
+
+int main(int argc, char** argv)
+{
+  // Initialize OpenGL, but only on the "master" thread or process.
+  // See the assignment writeup to determine which is "master" 
+  // and which is slave.
+  initColors();
+  createCudaThreads();
+  glutInit(&argc, argv);
+  glutInitWindowSize(WINDOW_DIM,WINDOW_DIM);
+  glutInitDisplayMode(GLUT_RGB | GLUT_DOUBLE | GLUT_DEPTH);
+  glutInitWindowPosition(100,100);
+  glutCreateWindow ("Mandelbrotset");
+  glClearColor(1.0,1.0,1.0,0);
+  init();
+  glMatrixMode(GL_MODELVIEW);
+  glutDisplayFunc(display);
+  glutMotionFunc(motion);
+  glutMouseFunc(mouse);
+  glutKeyboardFunc(keyboard);
+  // glutReshapeFunc(reshape);
+  glutTimerFunc(1, timer, 0);
+  glutMainLoop();
+  return 0;
+}
